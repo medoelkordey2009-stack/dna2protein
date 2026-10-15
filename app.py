@@ -1,3 +1,5 @@
+from concurrent.futures import ThreadPoolExecutor
+
 import requests
 import py3Dmol
 import streamlit as st
@@ -42,20 +44,24 @@ def predict_structure(protein):
     return r.text
 
 
-def mean_confidence(pdb):
-    vals = [
+def confidence_scores(pdb):
+    return [
         float(l[60:66])
         for l in pdb.splitlines()
         if l.startswith("ATOM") and l[12:16].strip() == "CA"
     ]
+
+
+def mean_confidence(pdb):
+    vals = confidence_scores(pdb)
     avg = sum(vals) / len(vals)
-    # The service returns 0-1, so convert to a 0-100 scale
+    # The service may return 0-1, so convert to a 0-100 scale
     return avg * 100 if avg <= 1 else avg
 
 
-# ---------- 3) Function ----------
-@st.cache_data(show_spinner=False)
-def blast_search(protein, top=5):
+# ---------- 3) Function (runs in the background) ----------
+def blast_raw(protein, top=5):
+    # No Streamlit calls in here, so it is safe to run in a background thread
     handle = NCBIWWW.qblast("blastp", "swissprot", protein, hitlist_size=top)
     record = NCBIXML.read(handle)
     results = []
@@ -65,6 +71,24 @@ def blast_search(protein, top=5):
             (round(100 * hsp.identities / hsp.align_length, 1), aln.title)
         )
     return results
+
+
+@st.cache_resource
+def get_executor():
+    return ThreadPoolExecutor(max_workers=2)
+
+
+@st.cache_resource
+def get_blast_jobs():
+    # protein sequence -> running/finished background job (shared, so repeats are instant)
+    return {}
+
+
+def start_blast(protein):
+    jobs = get_blast_jobs()
+    if protein not in jobs:
+        jobs[protein] = get_executor().submit(blast_raw, protein)
+    return jobs[protein]
 
 
 # ---------- Interface ----------
@@ -91,6 +115,10 @@ if st.session_state.get("show") and dna_input.strip():
         st.error("No suitable protein was found in this sequence.")
         st.stop()
 
+    # Start the slow function search right away, in the background,
+    # so it runs while you look at the protein and the 3D structure.
+    job = start_blast(protein)
+
     tab1, tab2, tab3 = st.tabs(["Protein", "3D Structure", "Function"])
 
     with tab1:
@@ -108,27 +136,38 @@ if st.session_state.get("show") and dna_input.strip():
                 with st.spinner("Predicting the 3D structure..."):
                     pdb = predict_structure(protein)
                 st.metric("Average confidence (out of 100)", f"{mean_confidence(pdb):.1f}")
+                st.caption("Colors: red = low confidence, blue = high confidence.")
+                st.download_button("Download structure (.pdb)", pdb, file_name="protein.pdb")
+
+                scores = confidence_scores(pdb)
+                top = 1.0 if max(scores) <= 1 else 100.0
                 view = py3Dmol.view(width=330, height=400)
                 view.addModel(pdb, "pdb")
-                view.setStyle({"cartoon": {"color": "spectrum"}})
+                view.setStyle({"cartoon": {"colorscheme": {
+                    "prop": "b", "gradient": "roygb",
+                    "min": 0.5 * top, "max": 0.9 * top}}})
                 view.zoomTo()
                 components.html(view._make_html(), height=420)
             except Exception as e:
                 st.error(f"The structure prediction service is unavailable right now. Try again later. ({e})")
 
     with tab3:
-        try:
-            with st.spinner(
-                "Searching for similar proteins... this can take a minute or more, keep this page open"
-            ):
-                hits = blast_search(protein)
-            if not hits:
-                st.info("No sufficient match found. The function is unknown.")
-            for identity, title in hits:
-                st.write(f"**{identity}%** — {title[:100]}")
-            st.caption(
-                "Above about 40% identity: the function is likely similar. "
-                "Below 25%: weak similarity."
+        if job.done():
+            try:
+                hits = job.result()
+                if not hits:
+                    st.info("No sufficient match found. The function is unknown.")
+                for identity, title in hits:
+                    st.write(f"**{identity}%** — {title[:100]}")
+                st.caption(
+                    "Above about 40% identity: the function is likely similar. "
+                    "Below 25%: weak similarity."
+                )
+            except Exception as e:
+                st.error(f"The search failed. Please try again. ({e})")
+        else:
+            st.info(
+                "The function search is running in the background on NCBI servers "
+                "(usually 1-3 minutes). Keep this page open, then click the button below."
             )
-        except Exception as e:
-            st.error(f"The search failed. Please try again. ({e})")
+            st.button("Check results")
