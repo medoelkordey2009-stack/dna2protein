@@ -8,9 +8,9 @@ from Bio.Blast import NCBIWWW, NCBIXML
 st.set_page_config(page_title="DNA → Protein", page_icon="🧬")
 
 
-# ---------- 1) من DNA لبروتين ----------
+# ---------- 1) DNA to protein ----------
 def clean_dna(text):
-    # نشيل سطر الـ FASTA (اللي بيبدأ بـ >) والمسافات والأسطر
+    # Remove FASTA header lines (starting with >), spaces and line breaks
     lines = [l for l in text.splitlines() if not l.startswith(">")]
     return "".join("".join(lines).split()).upper()
 
@@ -30,7 +30,7 @@ def find_longest_orf(dna_text):
     return best
 
 
-# ---------- 2) الشكل ثلاثي الأبعاد ----------
+# ---------- 2) 3D structure ----------
 @st.cache_data(show_spinner=False)
 def predict_structure(protein):
     r = requests.post(
@@ -48,10 +48,12 @@ def mean_confidence(pdb):
         for l in pdb.splitlines()
         if l.startswith("ATOM") and l[12:16].strip() == "CA"
     ]
-    return sum(vals) / len(vals)
+    avg = sum(vals) / len(vals)
+    # The service returns 0-1, so convert to a 0-100 scale
+    return avg * 100 if avg <= 1 else avg
 
 
-# ---------- 3) الوظيفة ----------
+# ---------- 3) Function ----------
 @st.cache_data(show_spinner=False)
 def blast_search(protein, top=5):
     handle = NCBIWWW.qblast("blastp", "swissprot", protein, hitlist_size=top)
@@ -65,64 +67,68 @@ def blast_search(protein, top=5):
     return results
 
 
-# ---------- الواجهة ----------
+# ---------- Interface ----------
 st.title("🧬 DNA → Protein")
 st.caption(
-    "كل النتايج توقعات علمية، مش حقايق مؤكدة. "
-    "استخدم cDNA أو جين بكتيري (من غير introns)."
+    "All results are scientific predictions, not confirmed facts. "
+    "Use cDNA or a bacterial gene (no introns)."
 )
 
-dna_input = st.text_area(
-    "الصق تسلسل DNA هنا (بعد اللصق اضغط برّه الخانة وهيبدأ التحليل لوحده)",
-    height=150,
-)
+dna_input = st.text_area("Paste your DNA sequence here", height=150)
 
-if dna_input.strip():
+if st.button("Show answers", type="primary"):
+    st.session_state["show"] = True
+
+if st.session_state.get("show") and dna_input.strip():
     dna = clean_dna(dna_input)
 
     if not set(dna) <= set("ACGTN"):
-        st.error("فيه حروف مش A / C / G / T في التسلسل.")
+        st.error("The sequence contains characters other than A / C / G / T.")
         st.stop()
 
     protein = find_longest_orf(dna)
     if len(protein) < 50:
-        st.error("ملقيتش بروتين مناسب في التسلسل ده.")
+        st.error("No suitable protein was found in this sequence.")
         st.stop()
 
-    tab1, tab2, tab3 = st.tabs(["البروتين", "الشكل 3D", "الوظيفة"])
+    tab1, tab2, tab3 = st.tabs(["Protein", "3D Structure", "Function"])
 
     with tab1:
         st.code(protein)
-        st.write(f"الطول: **{len(protein)}** حمض أميني")
+        st.write(f"Length: **{len(protein)}** amino acids")
 
     with tab2:
         if len(protein) > 400:
-            st.warning("البروتين أطول من 400 حمض أميني، والخدمة المجانية مش هتقبله.")
+            st.warning(
+                "The protein is longer than 400 amino acids, "
+                "which the free prediction service does not accept."
+            )
         else:
             try:
-                with st.spinner("بتوقع الشكل..."):
+                with st.spinner("Predicting the 3D structure..."):
                     pdb = predict_structure(protein)
-                st.metric("متوسط الثقة (من 100)", f"{mean_confidence(pdb):.1f}")
+                st.metric("Average confidence (out of 100)", f"{mean_confidence(pdb):.1f}")
                 view = py3Dmol.view(width=330, height=400)
                 view.addModel(pdb, "pdb")
                 view.setStyle({"cartoon": {"color": "spectrum"}})
                 view.zoomTo()
                 components.html(view._make_html(), height=420)
             except Exception as e:
-                st.error(f"خدمة توقع الشكل مش شغالة دلوقتي. جرب بعد شوية. ({e})")
+                st.error(f"The structure prediction service is unavailable right now. Try again later. ({e})")
 
     with tab3:
         try:
             with st.spinner(
-                "بدوّر على بروتينات مشابهة... ممكن ياخد دقيقة أو أكتر، سيب الصفحة مفتوحة"
+                "Searching for similar proteins... this can take a minute or more, keep this page open"
             ):
                 hits = blast_search(protein)
             if not hits:
-                st.info("مفيش تطابق كافي. الوظيفة غير معروفة.")
+                st.info("No sufficient match found. The function is unknown.")
             for identity, title in hits:
                 st.write(f"**{identity}%** — {title[:100]}")
             st.caption(
-                "فوق 40% تقريباً: الوظيفة غالباً مشابهة. أقل من 25%: تشابه ضعيف."
+                "Above about 40% identity: the function is likely similar. "
+                "Below 25%: weak similarity."
             )
         except Exception as e:
-            st.error(f"البحث فشل. جرب تاني. ({e})")
+            st.error(f"The search failed. Please try again. ({e})")
